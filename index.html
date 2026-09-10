@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#05060d">
+<title>泡沫 · Foam</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    width:100%; height:100%;
+    background: radial-gradient(circle at 50% 40%, #0b1024 0%, #05060d 70%);
+    overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  #stage {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #scene {
+    display: block;
+    border-radius: 16px;
+    background: #06080f;
+    box-shadow:
+      0 0 0 1px rgba(120,190,255,.14),
+      0 0 60px rgba(60,140,255,.22),
+      0 0 150px rgba(120,80,255,.14),
+      0 30px 80px rgba(0,0,0,.6);
+    touch-action: none;
+    cursor: crosshair;
+  }
+  #hint {
+    position: fixed; left:50%; bottom: 5%;
+    transform: translateX(-50%);
+    color: rgba(175,218,255,.8);
+    font-size: 13px; line-height: 1.7;
+    letter-spacing: .14em;
+    text-align: center;
+    pointer-events: none;
+    transition: opacity 1s ease;
+    text-shadow: 0 0 20px rgba(90,180,255,.8);
+    white-space: nowrap;
+  }
+  #hint.hide { opacity: 0; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="scene"></canvas></div>
+<div id="hint">摇动手机 / 快速划动 —— 泛起泡沫<br>轻触或拖动 —— 戳破它们</div>
+
+<script>
+(function () {
+'use strict';
+
+/* ============================================================
+   基础设置  904 × 572
+   ============================================================ */
+const W = 904, H = 572;
+const canvas = document.getElementById('scene');
+const ctx = canvas.getContext('2d', { alpha: false });
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+canvas.width  = Math.round(W * DPR);
+canvas.height = Math.round(H * DPR);
+ctx.scale(DPR, DPR);
+
+function fit() {
+  const s = Math.min(
+    (window.innerWidth  - 28) / W,
+    (window.innerHeight - 28) / H
+  );
+  const scale = Math.max(0.28, Math.min(s, 1.85));
+  canvas.style.width  = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+}
+window.addEventListener('resize', fit);
+window.addEventListener('orientationchange', () => setTimeout(fit, 200));
+fit();
+
+const TAU   = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const rand  = (a, b) => a + Math.random() * (b - a);
+
+/* ============================================================
+   预渲染光点精灵（24 色相），大幅降低每帧渐变开销
+   ============================================================ */
+const SPRITES = [];
+(function buildSprites() {
+  const S = 64, STEPS = 24;
+  for (let i = 0; i < STEPS; i++) {
+    const hue = i * (360 / STEPS);
+    const c = document.createElement('canvas');
+    c.width = c.height = S;
+    const g = c.getContext('2d');
+    const grd = g.createRadialGradient(S/2, S/2, 0, S/2, S/2, S/2);
+    grd.addColorStop(0.00, `hsla(${hue},100%,95%,1)`);
+    grd.addColorStop(0.16, `hsla(${hue},100%,80%,0.72)`);
+    grd.addColorStop(0.44, `hsla(${hue},100%,64%,0.24)`);
+    grd.addColorStop(1.00, `hsla(${hue},100%,55%,0)`);
+    g.fillStyle = grd;
+    g.fillRect(0, 0, S, S);
+    SPRITES.push(c);
+  }
+})();
+function getSprite(hue) {
+  let i = Math.floor(hue / 15) % 24;
+  if (i < 0) i += 24;
+  return SPRITES[i];
+}
+function drawSprite(hue, x, y, size, alpha) {
+  if (alpha <= 0.004 || size <= 0.4) return;
+  ctx.globalAlpha = alpha > 1 ? 1 : alpha;
+  ctx.drawImage(getSprite(hue), x - size * 0.5, y - size * 0.5, size, size);
+  ctx.globalAlpha = 1;
+}
+
+/* ============================================================
+   背景 & 氛围光斑
+   ============================================================ */
+const bgGrad = ctx.createLinearGradient(0, 0, W, H);
+bgGrad.addColorStop(0.00, '#070c1c');
+bgGrad.addColorStop(0.45, '#0a0a1e');
+bgGrad.addColorStop(1.00, '#0d0718');
+
+const vignette = ctx.createRadialGradient(W*0.5, H*0.5, H*0.34, W*0.5, H*0.5, H*1.06);
+vignette.addColorStop(0, 'rgba(0,0,0,0)');
+vignette.addColorStop(1, 'rgba(0,0,0,0.62)');
+
+const blobs = [];
+for (let i = 0; i < 6; i++) {
+  blobs.push({
+    x: rand(0, W), y: rand(0, H),
+    r: rand(150, 330),
+    hue: rand(180, 320),
+    vx: rand(-9, 9), vy: rand(-9, 9),
+    a: rand(0.028, 0.07),
+    ph: rand(0, TAU)
+  });
+}
+
+/* ============================================================
+   实体容器
+   ============================================================ */
+const bubbles   = [];
+const particles = [];
+const waves     = [];
+
+let tilt       = { x: 0, y: 0 };
+let tiltTarget = { x: 0, y: 0 };
+let shakeAccum = 0;
+let envTimer   = 0;
+let elapsed    = 0;
+
+/* ============================================================
+   泡沫
+   ============================================================ */
+class Bubble {
+  constructor(x, y, r) {
+    this.x = x;
+    this.y = y;
+    this.r = r * 0.22;      // 初始很小，会“膨”起来
+    this.tr = r;            // 目标半径
+    this.vx = rand(-70, 70);
+    this.vy = rand(-70, 70);
+    this.life = 0;
+    this.maxLife = rand(5, 13);
+    this.hue = rand(175, 300);
+    this.phase = rand(0, TAU);
+    this.wobble = rand(0.6, 2.0);
+    this.spin = rand(-0.6, 0.6);
+    this.dead = false;
+  }
+
+  update(dt, gx, gy) {
+    this.life += dt;
+    if (this.life >= this.maxLife) { this.dead = true; return; }
+
+    // 膨胀
+    this.r += (this.tr - this.r) * Math.min(1, dt * 3.6);
+
+    // 浮力（向上）
+    this.vy -= 26 * dt;
+
+    // 陀螺仪倾向 → 重力
+    this.vx += gx * 300 * dt;
+    this.vy += gy * 300 * dt;
+
+    // 阻尼
+    const damp = Math.exp(-1.15 * dt);
+    this.vx *= damp;
+    this.vy *= damp;
+
+    // 左右摇曳
+    this.x += Math.sin(this.life * 2.3 + this.phase) * this.wobble * 16 * dt;
+
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+
+    // 边界软化
+    const m = 70;
+    if (this.x < -m) { this.x = -m; this.vx *= -0.45; }
+    if (this.x > W + m) { this.x = W + m; this.vx *= -0.45; }
+    if (this.y < -140) { this.dead = true; }
+    if (this.y > H + m) { this.y = H + m; this.vy *= -0.45; }
+  }
+
+  get alpha() {
+    const t = this.life / this.maxLife;
+    const fadeIn = Math.min(1, this.life * 3.2);
+    let fadeOut = 1;
+    if (t > 0.62) {
+      const k = (t - 0.62) / 0.38;
+      fadeOut = Math.max(0, 1 - k);
+      fadeOut *= fadeOut;
+    }
+    return fadeIn * fadeOut;
+  }
+
+  get radius() {
+    const t = this.life / this.maxLife;
+    return t > 0.62 ? this.r * (1 - (t - 0.62) * 0.55) : this.r;
+  }
+}
+
+/* ============================================================
+   生成 / 戳破
+   ============================================================ */
+function spawnBubbles(n, ambient) {
+  for (let i = 0; i < n; i++) {
+    let x, y;
+    if (ambient) {
+      x = rand(W * 0.05, W * 0.95);
+      y = rand(H * 0.55, H + 20);
+    } else {
+      x = rand(W * 0.04, W * 0.96);
+      y = rand(H * 0.10, H * 0.98);
+    }
+    bubbles.push(new Bubble(x, y, rand(5, 27)));
+  }
+  if (bubbles.length > 220) bubbles.splice(0, bubbles.length - 220);
+}
+
+function burstBubble(b) {
+  // 碎片粒子
+  const n = clamp(Math.round(6 + b.r * 0.9), 6, 26);
+  for (let i = 0; i < n; i++) {
+    const a  = Math.random() * TAU;
+    const sp = rand(50, 60 + b.r * 7.5);
+    particles.push({
+      x: b.x + Math.cos(a) * b.r * 0.55,
+      y: b.y + Math.sin(a) * b.r * 0.55,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp - 25,
+      r: rand(1.2, 1.2 + b.r * 0.17),
+      hue: b.hue + rand(-45, 45),
+      life: 0,
+      maxLife: rand(0.35, 0.95)
+    });
+  }
+  // 中心闪光
+  particles.push({
+    x: b.x, y: b.y, vx: 0, vy: 0,
+    r: b.r * 0.38, hue: b.hue,
+    life: 0, maxLife: 0.28
+  });
+  // 冲击波
+  waves.push({
+    x: b.x, y: b.y,
+    r0: b.r * 0.55, r1: b.r * 3.4,
+    life: 0, maxLife: 0.48,
+    hue: b.hue, w: 2.4
+  });
+}
+
+function popAt(x, y, radius) {
+  let hit = 0;
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    if (b.dead) continue;
+    const d = Math.hypot(b.x - x, b.y - y);
+    if (d < radius + b.r * 0.55) {
+      burstBubble(b);
+      bubbles.splice(i, 1);
+      hit++;
+    }
+  }
+  return hit;
+}
+
+/* ============================================================
+   输入：指针
+   ============================================================ */
+const pointer = { x: -999, y: -999, down: false, inside: false };
+let lastPX = 0, lastPY = 0, lastPT = performance.now();
+const hintEl = document.getElementById('hint');
+let hintHidden = false;
+
+function hideHint() {
+  if (hintHidden) return;
+  hintHidden = true;
+  hintEl.classList.add('hide');
+  setTimeout(() => hintEl.remove(), 1200);
+}
+
+function toLocal(cx, cy) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (cx - r.left) / r.width  * W,
+    y: (cy - r.top)  / r.height * H
+  };
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  hideHint();
+  enableMotion();
+
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+
+  const p = toLocal(e.clientX, e.clientY);
+  pointer.down = true;
+  pointer.inside = true;
+  pointer.x = p.x; pointer.y = p.y;
+  lastPX = p.x; lastPY = p.y; lastPT = performance.now();
+
+  popAt(p.x, p.y, 80);
+  waves.push({
+    x: p.x, y: p.y, r0: 4, r1: 96,
+    life: 0, maxLife: 0.34, hue: 196, w: 2
+  });
+}, { passive: false });
+
+canvas.addEventListener('pointermove', (e) => {
+  const p = toLocal(e.clientX, e.clientY);
+  const now = performance.now();
+  const dtm = Math.max(8, now - lastPT);
+  const v = Math.hypot(p.x - lastPX, p.y - lastPY) / dtm * 1000;
+
+  pointer.x = p.x; pointer.y = p.y; pointer.inside = true;
+
+  if (pointer.down) {
+    popAt(p.x, p.y, 80);
+  } else if (v > 720) {
+    shakeAccum = Math.min(150, shakeAccum + Math.min(10, (v - 720) / 230));
+    hideHint();
+  }
+
+  lastPX = p.x; lastPY = p.y; lastPT = now;
+}, { passive: true });
+
+canvas.addEventListener('pointerup',     () => { pointer.down = false; });
+canvas.addEventListener('pointercancel', () => { pointer.down = false; });
+canvas.addEventListener('pointerleave',  () => { pointer.inside = false; });
+
+/* ============================================================
+   输入：陀螺仪 / 加速度计
+   ============================================================ */
+let motionAttached = false;
+
+function attachMotion() {
+  if (motionAttached) return;
+  motionAttached = true;
+  window.addEventListener('devicemotion', onMotion, { passive: true });
+  window.addEventListener('deviceorientation', onOrient, { passive: true });
+}
+
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity || e.acceleration;
+  if (!a || a.x == null) return;
+  const mag = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+  const excess = Math.abs(mag - 9.81);
+  if (excess > 2.2) {
+    shakeAccum = Math.min(170, shakeAccum + (excess - 2.2) * 1.3);
+  }
+}
+
+function onOrient(e) {
+  if (e.gamma == null && e.beta == null) return;
+  const gamma = e.gamma || 0;   // 左右倾斜
+  const beta  = e.beta  || 0;   // 前后倾斜
+  tiltTarget.x = clamp(gamma / 28, -1, 1);
+  tiltTarget.y = clamp((beta - 90) / 45, -1, 1);
+}
+
+function enableMotion() {
+  const needPerm =
+    (typeof DeviceMotionEvent !== 'undefined' &&
+     typeof DeviceMotionEvent.requestPermission === 'function') ||
+    (typeof DeviceOrientationEvent !== 'undefined' &&
+     typeof DeviceOrientationEvent.requestPermission === 'function');
+
+  if (!needPerm) { attachMotion(); return; }
+
+  const req = (Ctor) => (
+    typeof Ctor !== 'undefined' && Ctor && typeof Ctor.requestPermission === 'function'
+      ? Ctor.requestPermission().catch(() => {})
+      : Promise.resolve()
+  );
+
+  Promise.all([req(window.DeviceMotionEvent), req(window.DeviceOrientationEvent)])
+    .then(() => attachMotion())
+    .catch(() => {});
+}
+
+// 非 iOS 环境直接挂载
+if (!(typeof DeviceMotionEvent !== 'undefined' &&
+      typeof DeviceMotionEvent.requestPermission === 'function')) {
+  attachMotion();
+}
+
+/* ============================================================
+   更新
+   ============================================================ */
+function update(dt) {
+  elapsed += dt;
+
+  // 倾斜平滑
+  const k = Math.min(1, dt * 4.2);
+  tilt.x += (tiltTarget.x - tilt.x) * k;
+  tilt.y += (tiltTarget.y - tilt.y) * k;
+
+  // 摇晃 → 泡沫
+  const n = Math.min(11, Math.floor(shakeAccum * 0.30));
+  if (n > 0) spawnBubbles(n, false);
+  shakeAccum *= Math.exp(-5 * dt);
+  if (shakeAccum < 0.02) shakeAccum = 0;
+
+  // 环境自生（保持画面不空）
+  envTimer -= dt;
+  if (envTimer <= 0 && bubbles.length < 85) {
+    envTimer = rand(0.55, 1.7);
+    spawnBubbles(1, true);
+  }
+
+  // 泡沫
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.update(dt, tilt.x, tilt.y);
+    if (b.dead) bubbles.splice(i, 1);
+  }
+
+  // 粒子
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life += dt;
+    if (p.life >= p.maxLife) { particles.splice(i, 1); continue; }
+    p.vy += 95 * dt;
+    const d = Math.exp(-1.6 * dt);
+    p.vx *= d; p.vy *= d;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+  }
+
+  // 冲击波
+  for (let i = waves.length - 1; i >= 0; i--) {
+    const w = waves[i];
+    w.life += dt;
+    if (w.life >= w.maxLife) waves.splice(i, 1);
+  }
+
+  // 氛围光斑
+  for (const b of blobs) {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.x < -b.r) b.x = W + b.r;
+    if (b.x > W + b.r) b.x = -b.r;
+    if (b.y < -b.r) b.y = H + b.r;
+    if (b.y > H + b.r) b.y = -b.r;
+    b.r += Math.sin(elapsed * 0.4 + b.ph) * 8 * dt;
+  }
+}
+
+/* ============================================================
+   绘制
+   ============================================================ */
+function drawBubble(b) {
+  const a = b.alpha;
+  if (a < 0.015) return;
+  const r = b.radius;
+  if (r < 0.7) return;
+
+  const hue = b.hue;
+  ctx.save();
+  ctx.translate(b.x, b.y);
+
+  // 外发光（精灵图，廉价）
+  drawSprite(hue, 0, 0, r * 3.6, a * 0.30);
+
+  // 主体渐变
+  const g = ctx.createRadialGradient(-r * 0.32, -r * 0.36, r * 0.03, 0, 0, r);
+  g.addColorStop(0.00, `hsla(${hue + 15},100%,98%,${0.42 * a})`);
+  g.addColorStop(0.14, `hsla(${hue + 10},100%,86%,${0.10 * a})`);
+  g.addColorStop(0.60, `hsla(${hue},95%,60%,${0.045 * a})`);
+  g.addColorStop(0.85, `hsla(${hue},100%,72%,${0.17 * a})`);
+  g.addColorStop(1.00, `hsla(${hue + 25},100%,92%,${0.58 * a})`);
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, TAU);
+  ctx.fill();
+
+  // 高光点
+  const hx = -r * 0.36, hy = -r * 0.42, hr = r * 0.30;
+  drawSprite(45, hx, hy, hr * 2.6, a * 0.55);
+
+  // 底部反光弧
+  ctx.strokeStyle = `hsla(${hue + 40},100%,95%,${0.34 * a})`;
+  ctx.lineWidth = Math.max(0.5, r * 0.085);
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.80, Math.PI * 0.12, Math.PI * 0.52);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function render() {
+  /* --- 背景 --- */
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  /* --- 氛围光斑 --- */
+  ctx.globalCompositeOperation = 'lighter';
+  for (const b of blobs) {
+    const g = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.r);
+    g.addColorStop(0.0, `hsla(${b.hue},90%,62%,${b.a})`);
+    g.addColorStop(0.5, `hsla(${b.hue},90%,56%,${b.a * 0.34})`);
+    g.addColorStop(1.0, `hsla(${b.hue},90%,50%,0)`);
+    ctx.fillStyle = g;
+    ctx.fillRect(b.x - b.r, b.y - b.r, b.r * 2, b.r * 2);
+  }
+
+  /* --- 泡沫 --- */
+  for (const b of bubbles) drawBubble(b);
+
+  /* --- 粒子 --- */
+  for (const p of particles) {
+    const t = p.life / p.maxLife;
+    const a = (1 - t) * (1 - t);
+    if (a <= 0.01) continue;
+    const size = p.r * 7 * (0.65 + 0.35 * (1 - t));
+    drawSprite(p.hue, p.x, p.y, size, a * 0.85);
+  }
+
+  /* --- 冲击波 --- */
+  for (const w of waves) {
+    const t = w.life / w.maxLife;
+    const ease = 1 - Math.pow(1 - t, 3);
+    const r = w.r0 + (w.r1 - w.r0) * ease;
+    const a = (1 - t) * (1 - t);
+    ctx.strokeStyle = `hsla(${w.hue},100%,82%,${a * 0.62})`;
+    ctx.lineWidth = Math.max(0.5, w.w * (1 - t));
+    ctx.beginPath();
+    ctx.arc(w.x, w.y, r, 0, TAU);
+    ctx.stroke();
+  }
+
+  /* --- 指针光环 --- */
+  if (pointer.inside && pointer.x > -500) {
+    const px = pointer.x, py = pointer.y;
+    const rr = 80;
+    const pulse = 1 + Math.sin(elapsed * 5) * 0.05;
+    const g = ctx.createRadialGradient(px, py, 0, px, py, rr * pulse);
+    g.addColorStop(0.0, `rgba(150,225,255,${pointer.down ? 0.16 : 0.07})`);
+    g.addColorStop(0.65, `rgba(130,200,255,${pointer.down ? 0.05 : 0.02})`);
+    g.addColorStop(1.0, 'rgba(120,190,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(px, py, rr * pulse, 0, TAU);
+    ctx.fill();
+
+    ctx.strokeStyle = `rgba(160,225,255,${pointer.down ? 0.30 : 0.14})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(px, py, rr * pulse, 0, TAU);
+    ctx.stroke();
+  }
+
+  /* --- 暗角 --- */
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, W, H);
+}
+
+/* ============================================================
+   主循环
+   ============================================================ */
+let lastT = performance.now();
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dt = (now - lastT) / 1000;
+  lastT = now;
+  if (dt > 0.05) dt = 0.05;
+  if (dt < 0) dt = 0;
+
+  update(dt);
+  render();
+}
+
+// 开场先来一点泡沫
+spawnBubbles(22, false);
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
